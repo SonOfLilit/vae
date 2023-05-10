@@ -1,18 +1,18 @@
 import copy
 import time
 
+import torch
 from torchvision.models import resnet18
 import torch.utils.data
 import torchvision.datasets
+from torchvision import transforms
+from tqdm import tqdm
 
 import wandb
-
-N_THREADS = 4
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 args = {}
-wandb.init(config=args, save_code=True)
 
 
 def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
@@ -36,10 +36,8 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
             running_corrects = 0
 
             # Iterate over data.
-            for inputs, labels in dataloaders[phase]:
-                inputs = inputs.to(device)
+            for inputs, labels in tqdm(dataloaders[phase]):
                 labels = labels.to(device)
-
                 # zero the parameter gradients
                 optimizer.zero_grad()
 
@@ -48,6 +46,10 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
                 with torch.set_grad_enabled(phase == "train"):
                     # Get model outputs and calculate loss
                     outputs = model(inputs)
+                    B, _C, H, W = inputs.shape
+                    assert _C == 1
+                    assert outputs.shape == (B, 10)
+                    assert labels.shape == (B,)
                     loss = criterion(outputs, labels)
                     _, preds = torch.max(outputs, 1)
 
@@ -87,26 +89,65 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
     return model
 
 
+normalize = transforms.Normalize([72.9404 / 255], [90.0212 / 255])
+data_transforms = {
+    "train": transforms.Compose(
+        [
+            # transforms.RandomResizedCrop(input_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+            transforms.Lambda(lambda x: x.to(device)),
+        ]
+    ),
+    "val": transforms.Compose(
+        [
+            # transforms.Resize(input_size),
+            # transforms.CenterCrop(input_size),
+            transforms.ToTensor(),
+            normalize,
+            transforms.Lambda(lambda x: x.to(device)),
+        ]
+    ),
+}
+
 train_data = torchvision.datasets.FashionMNIST(
-    "fashion-mnist", train=True, download=True
+    "fashion-mnist",
+    train=True,
+    download=True,
+    transform=data_transforms["train"],
 )
 train_loader = torch.utils.data.DataLoader(
-    train_data, batch_size=64, shuffle=True, num_workers=N_THREADS
+    train_data,
+    batch_size=64,
+    shuffle=True,
 )
 
-test_data = torchvision.datasets.FashionMNIST("fashion-mnist", train=False)
+test_data = torchvision.datasets.FashionMNIST(
+    "fashion-mnist", train=False, transform=data_transforms["val"]
+)
 test_loader = torch.utils.data.DataLoader(
-    test_data, batch_size=64, shuffle=True, num_workers=N_THREADS
+    test_data,
+    batch_size=64,
+    shuffle=True,
 )
 
 model = resnet18()
+model.conv1 = torch.nn.Conv2d(
+    1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+)
 model.fc = torch.nn.Linear(in_features=512, out_features=10, bias=True)
+model = model.to(device)
+
+criterion = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.AdamW(model.parameters())
 
 if __name__ == "__main__":
+    wandb.init(config=args, save_code=True)
     try:
-        train_model(
-            model,
-            {"train": train_loader, "val": test_loader},
+        model = train_model(
+            model, {"train": train_loader, "val": test_loader}, criterion, optimizer
         )
-    except:
+        torch.save(model.state_dict(), "weights.pkl")
+    finally:
         wandb.finish()
